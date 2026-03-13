@@ -1,6 +1,6 @@
 # Recovering Deleted Twitter Content via the Wayback Machine
 
-*A methodology guide based on a real-world Twitter recovery case study*
+*A methodology guide based on an anonymized Twitter recovery case study*
 
 ---
 
@@ -171,15 +171,15 @@ data-time="1536984988"             # Second epoch
 
 **User data:**
 ```
-data-screen-name="FrameGames"
-data-name="Frame Game Radio"
-data-user-id="704778449706217472"
+data-screen-name="RecoveredHandle"
+data-name="Recovered Account"
+data-user-id="<user_id>"
 ```
 
 **Structural markers:**
 ```
-data-tweet-id="1039012748665995270"
-data-item-id="1039012748665995270"
+data-tweet-id="<tweet_id>"
+data-item-id="<tweet_id>"
 data-is-reply-to="true"
 data-conversation-id="..."
 ```
@@ -249,14 +249,14 @@ Once extracted, these JSON blobs contain tweet objects in Twitter's internal API
 
 ```json
 {
-  "rest_id": "1039012748665995270",
+  "rest_id": "<tweet_id>",
   "core": {
     "user_results": {
       "result": {
-        "rest_id": "704778449706217472",
+        "rest_id": "<user_id>",
         "legacy": {
-          "screen_name": "FrameGames",
-          "name": "Frame Game Radio",
+          "screen_name": "RecoveredHandle",
+          "name": "Recovered Account",
           "followers_count": 27198
         }
       }
@@ -344,11 +344,11 @@ Every recovered tweet links back to its specific archive capture:
 
 ```json
 {
-  "tweet_id": "1039012748665995270",
+  "tweet_id": "<tweet_id>",
   "archive_capture_timestamp": "20180910050000",
   "archive_capture_url": "https://web.archive.org/web/20180910050000id_/...",
   "archive_capture_mimetype": "application/json",
-  "raw_payload_path": "raw/status_json/1039012748665995270_20180910050000.json",
+  "raw_payload_path": "raw/status_json/<tweet_id>_20180910050000.json",
   "capture_history": [ ... all captures for this tweet ... ]
 }
 ```
@@ -447,8 +447,6 @@ From 25 visible snapshots to 809 recovered tweets -- a **32x multiplier** -- usi
 | `forensic_refresh_twitter_wayback.py` | Offline re-parse of cached payloads with improved heuristics |
 | `triage_twitter_wayback_residuals.py` | Classify unrecoverable rows |
 | `twitter_wayback_to_csv.py` | Export to CSV format |
-| `build_framegame_twitter_interaction_models.py` | Optional downstream network-analysis script from the original `transcript-lake` repo; not included in this seed |
-| `build_framegame_url_seed_job_configs.py` | Optional downstream URL-seed generation from the original `transcript-lake` repo; not included in this seed |
 
 ---
 
