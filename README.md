@@ -39,6 +39,22 @@ Run a fresh extraction for an account:
 python scripts/extract_twitter_wayback.py --account someaccount
 ```
 
+Start with a CDX-only overview before committing to a long crawl:
+
+```bash
+python scripts/extract_twitter_wayback.py --account someaccount --overview-only
+```
+
+Run a quick sample with explicit speed limits:
+
+```bash
+python scripts/extract_twitter_wayback.py \
+  --account someaccount \
+  --max-tweets 100 \
+  --max-timeline-captures 10 \
+  --max-capture-attempts-per-tweet 1
+```
+
 Outputs default to:
 
 ```text
@@ -74,6 +90,8 @@ data/twitter_wayback/<account-slug>/
     status_misc/
     timeline_html/
   derived/
+    inventory_summary.json
+    ACQUISITION_PLAN.md
     extraction_summary.json
     tweets_recovered.jsonl
     tweets_recovered_deduped.json
@@ -87,4 +105,7 @@ data/twitter_wayback/<account-slug>/
 
 - The extractor is networked; the refresh and triage scripts are offline.
 - Wayback rate limits aggressive querying. Use the built-in throttling and cached reruns.
+- `--overview-only` writes an acquisition summary before replay fetching.
+- `--checkpoint-every` keeps partial derived outputs current during long runs.
+- `--max-capture-attempts-per-tweet` is the main speed/coverage tradeoff knob for quick samples.
 - `docs/METHODOLOGY.md` includes an anonymized case study plus generalized recovery tactics.

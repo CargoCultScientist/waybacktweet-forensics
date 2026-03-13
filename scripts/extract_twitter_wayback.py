@@ -40,6 +40,10 @@ TIMELINE_TARGETS = {"timeline_main", "timeline_lower", "timeline_mobile_main", "
 STATUS_TARGETS = {"status_main", "status_lower", "status_mobile_main", "status_mobile_lower"}
 
 
+def utc_now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
 def account_slug(account: str) -> str:
     normalized = re.sub(r"[^a-z0-9]+", "-", (account or "").strip().lower()).strip("-")
     return normalized or "account"
@@ -87,8 +91,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-tweets", type=int, default=None, help="Limit tweet capture fetches for a partial run")
     parser.add_argument("--max-timeline-captures", type=int, default=None, help="Limit fetched timeline captures")
+    parser.add_argument(
+        "--max-capture-attempts-per-tweet",
+        type=int,
+        default=None,
+        help="Limit ranked status captures tried per tweet. Use 1-2 for faster overview runs.",
+    )
     parser.add_argument("--sleep-seconds", type=float, default=0.2, help="Base sleep between Wayback requests")
     parser.add_argument("--retries", type=int, default=4, help="Retry count for Wayback requests")
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=50,
+        help="Write partial derived outputs every N processed status tweet IDs. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--overview-only",
+        action="store_true",
+        help="Inventory CDX and write an acquisition overview without fetching replay captures.",
+    )
     parser.add_argument(
         "--refresh-existing",
         action="store_true",
@@ -143,6 +164,14 @@ def make_session() -> requests.Session:
 
 def sleep_with_jitter(seconds: float) -> None:
     time.sleep(seconds + random.uniform(0, max(seconds * 0.25, 0.05)))
+
+
+def maybe_sleep(seconds: float, *, diagnostics: dict[str, Any], enabled: bool) -> None:
+    if not enabled or seconds <= 0:
+        return
+    diagnostics["sleep_events"] += 1
+    diagnostics["sleep_seconds_requested"] += seconds
+    sleep_with_jitter(seconds)
 
 
 def request_with_retries(
@@ -1029,6 +1058,153 @@ def choose_best_capture(captures: list[dict[str, Any]]) -> dict[str, Any]:
     return max(captures, key=capture_rank)
 
 
+def format_duration(seconds: float | None) -> str:
+    if seconds is None or seconds < 0:
+        return "unknown"
+    rounded = int(seconds)
+    minutes, secs = divmod(rounded, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def estimate_eta(elapsed_seconds: float, completed: int, total: int) -> str:
+    if completed <= 0 or elapsed_seconds <= 0 or total <= completed:
+        return "unknown"
+    per_item = elapsed_seconds / completed
+    return format_duration(per_item * (total - completed))
+
+
+def build_inventory_overview(
+    *,
+    account: str,
+    output_dir: Path,
+    all_cdx_rows: dict[str, list[dict[str, str]]],
+    timeline_rows: list[dict[str, Any]],
+    status_rows: list[dict[str, Any]],
+    status_groups: dict[str, list[dict[str, Any]]],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    statuscode_counts = Counter(row.get("statuscode") or "" for row in status_rows)
+    mimetype_counts = Counter((row.get("mimetype") or "unk").split(";")[0] for row in status_rows)
+    tweet_ids_with_json = {
+        row["tweet_id"]
+        for row in status_rows
+        if "application/json" in (row.get("mimetype") or "").lower() and (row.get("statuscode") or "") in {"200", "-"}
+    }
+    tweet_ids_with_html_200 = {
+        row["tweet_id"]
+        for row in status_rows
+        if "text/html" in (row.get("mimetype") or "").lower() and (row.get("statuscode") or "") in {"200", "-"}
+    }
+    overview = {
+        "account": account,
+        "generated_at_utc": utc_now_iso(),
+        "output_dir": str(output_dir),
+        "run_parameters": {
+            "offline": args.offline,
+            "sleep_seconds": args.sleep_seconds,
+            "max_tweets": args.max_tweets,
+            "max_timeline_captures": args.max_timeline_captures,
+            "max_capture_attempts_per_tweet": args.max_capture_attempts_per_tweet,
+            "checkpoint_every": args.checkpoint_every,
+        },
+        "target_row_counts": {name: len(rows) for name, rows in all_cdx_rows.items()},
+        "timeline_capture_rows": len(timeline_rows),
+        "status_capture_rows": len(status_rows),
+        "unique_tweet_ids": len(status_groups),
+        "unique_tweet_ids_with_json_capture": len(tweet_ids_with_json),
+        "unique_tweet_ids_with_html_200_capture": len(tweet_ids_with_html_200),
+        "earliest_tweet_created_at_estimated": min((snowflake_to_iso(tweet_id) for tweet_id in status_groups), default=None),
+        "latest_tweet_created_at_estimated": max((snowflake_to_iso(tweet_id) for tweet_id in status_groups), default=None),
+        "statuscode_counts": dict(statuscode_counts.most_common()),
+        "status_mimetype_counts": dict(mimetype_counts.most_common()),
+        "recommended_quick_run": [
+            "python scripts/extract_twitter_wayback.py --account <handle> --overview-only",
+            "python scripts/extract_twitter_wayback.py --account <handle> --max-tweets 100 --max-timeline-captures 10 --max-capture-attempts-per-tweet 1",
+        ],
+        "recommended_exhaustive_run": "python scripts/extract_twitter_wayback.py --account <handle>",
+    }
+    return overview
+
+
+def build_acquisition_plan(overview: dict[str, Any]) -> str:
+    row_counts = overview.get("target_row_counts", {})
+    statuscode_counts = overview.get("statuscode_counts", {})
+    mimetype_counts = overview.get("status_mimetype_counts", {})
+    lines = [
+        f"# {overview['account']} Twitter Wayback Acquisition Plan",
+        "",
+        f"Target account: `https://twitter.com/{overview['account']}`",
+        "",
+        "## Preliminary Inventory",
+        "",
+        f"- Timeline capture rows across queried variants: {overview['timeline_capture_rows']}",
+        f"- Status capture rows across queried variants: {overview['status_capture_rows']}",
+        f"- Unique archived tweet IDs observed: {overview['unique_tweet_ids']}",
+        f"- Tweet IDs with at least one JSON capture: {overview['unique_tweet_ids_with_json_capture']}",
+        f"- Tweet IDs with at least one HTTP 200 HTML capture: {overview['unique_tweet_ids_with_html_200_capture']}",
+        f"- Earliest recoverable tweet ID date estimate: {overview.get('earliest_tweet_created_at_estimated') or ''}",
+        f"- Latest recoverable tweet ID date estimate: {overview.get('latest_tweet_created_at_estimated') or ''}",
+        "",
+        "## CDX Target Counts",
+        "",
+    ]
+    for name, count in row_counts.items():
+        lines.append(f"- `{name}`: {count}")
+    lines.extend(["", "## Status Capture Mix", ""])
+    for statuscode, count in statuscode_counts.items():
+        lines.append(f"- status `{statuscode or 'blank'}`: {count}")
+    for mimetype, count in mimetype_counts.items():
+        lines.append(f"- mimetype `{mimetype}`: {count}")
+    lines.extend(
+        [
+            "",
+            "## Suggested Run Sequence",
+            "",
+            "- Overview first: `--overview-only` to estimate scope without replay fetches.",
+            "- Fast sample second: `--max-tweets 100 --max-timeline-captures 10 --max-capture-attempts-per-tweet 1`.",
+            "- Exhaustive crawl last: remove the limits once the overview justifies the cost.",
+            "- Faster reruns: reuse the same output directory so cached raw captures are reused.",
+            "",
+            "## Speed Knobs",
+            "",
+            "- `--max-tweets`: cap how many status tweet IDs are materialized in this run.",
+            "- `--max-timeline-captures`: cap timeline replay fetches. Timeline is useful, but status pages are the primary source.",
+            "- `--max-capture-attempts-per-tweet`: try only the top-ranked 1-2 captures per tweet in quick runs.",
+            "- `--offline`: parse only cached raw files and skip network replay fetches.",
+            "- `--checkpoint-every`: keep partial derived outputs current during long runs.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def write_inventory_outputs(derived_dir: Path, overview: dict[str, Any]) -> None:
+    write_json(derived_dir / "inventory_summary.json", overview)
+    (derived_dir / "ACQUISITION_PLAN.md").write_text(build_acquisition_plan(overview), encoding="utf-8")
+
+
+def print_inventory_overview(overview: dict[str, Any]) -> None:
+    print(
+        "[overview] "
+        f"status_rows={overview['status_capture_rows']} "
+        f"unique_tweet_ids={overview['unique_tweet_ids']} "
+        f"json_tweet_ids={overview['unique_tweet_ids_with_json_capture']} "
+        f"html_200_tweet_ids={overview['unique_tweet_ids_with_html_200_capture']}",
+        flush=True,
+    )
+    print(
+        "[overview] "
+        "Quick sample knobs: --max-tweets 100 --max-timeline-captures 10 --max-capture-attempts-per-tweet 1. "
+        "Exhaustive crawl: remove limits and keep the same output dir for cache reuse.",
+        flush=True,
+    )
+
+
 def maybe_read_existing_capture(raw_path: Path) -> str | None:
     return raw_path.read_text(encoding="utf-8") if raw_path.exists() else None
 
@@ -1074,6 +1250,7 @@ def fetch_and_store_capture(
     sleep_seconds: float,
     refresh_existing: bool,
     offline: bool,
+    diagnostics: dict[str, Any],
 ) -> dict[str, Any]:
     if not refresh_existing:
         existing_path = (
@@ -1086,6 +1263,8 @@ def fetch_and_store_capture(
             if existing is not None:
                 capture["raw_path"] = str(existing_path)
                 capture["content"] = existing
+                capture["fetch_source"] = "cache"
+                diagnostics["status_cache_hits"] += 1
                 return capture
 
     mimetype = (capture.get("mimetype") or "").lower()
@@ -1096,12 +1275,14 @@ def fetch_and_store_capture(
     if not fetchable:
         capture["raw_path"] = None
         capture["content"] = ""
+        capture["fetch_source"] = "not_fetchable"
         return capture
 
     if offline:
         capture["raw_path"] = None
         capture["content"] = ""
         capture["fetch_error"] = "offline_missing_raw_capture"
+        capture["fetch_source"] = "offline_missing_raw"
         return capture
 
     try:
@@ -1116,6 +1297,8 @@ def fetch_and_store_capture(
         capture["raw_path"] = None
         capture["content"] = ""
         capture["fetch_error"] = str(exc)
+        capture["fetch_source"] = "error"
+        diagnostics["status_fetch_errors"] += 1
         return capture
     resp.encoding = "utf-8"
     content = resp.text
@@ -1127,6 +1310,8 @@ def fetch_and_store_capture(
     capture["mimetype"] = resp.headers.get("content-type", capture.get("mimetype", ""))
     capture["raw_path"] = str(raw_path)
     capture["content"] = content
+    capture["fetch_source"] = "network"
+    diagnostics["status_network_fetches"] += 1
     return capture
 
 
@@ -1139,31 +1324,45 @@ def fetch_and_store_timeline_capture(
     sleep_seconds: float,
     refresh_existing: bool,
     offline: bool,
+    diagnostics: dict[str, Any],
 ) -> dict[str, Any]:
     raw_path = raw_dir / "timeline_html" / f"{capture['capture_name']}_{capture['timestamp']}.html"
     if raw_path.exists() and not refresh_existing:
         capture["raw_path"] = str(raw_path)
         capture["content"] = raw_path.read_text(encoding="utf-8")
+        capture["fetch_source"] = "cache"
+        diagnostics["timeline_cache_hits"] += 1
         return capture
 
     if offline:
         capture["raw_path"] = None
         capture["content"] = ""
         capture["fetch_error"] = "offline_missing_raw_capture"
+        capture["fetch_source"] = "offline_missing_raw"
         return capture
 
-    resp = request_with_retries(
-        session,
-        "GET",
-        capture["replay_url"],
-        retries=retries,
-        sleep_seconds=sleep_seconds,
-    )
+    try:
+        resp = request_with_retries(
+            session,
+            "GET",
+            capture["replay_url"],
+            retries=retries,
+            sleep_seconds=sleep_seconds,
+        )
+    except requests.RequestException as exc:
+        capture["raw_path"] = None
+        capture["content"] = ""
+        capture["fetch_error"] = str(exc)
+        capture["fetch_source"] = "error"
+        diagnostics["timeline_fetch_errors"] += 1
+        return capture
     resp.encoding = "utf-8"
     ensure_dir(raw_path.parent)
     raw_path.write_text(resp.text, encoding="utf-8")
     capture["raw_path"] = str(raw_path)
     capture["content"] = resp.text
+    capture["fetch_source"] = "network"
+    diagnostics["timeline_network_fetches"] += 1
     return capture
 
 
@@ -1274,6 +1473,226 @@ def build_report(*, summary: dict[str, Any], tweets: list[dict[str, Any]], profi
     return "\n".join(lines).strip() + "\n"
 
 
+def build_runtime_diagnostics(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "run_mode": "overview_only" if args.overview_only else "crawl",
+        "offline": args.offline,
+        "refresh_existing": args.refresh_existing,
+        "requested_max_tweets": args.max_tweets,
+        "requested_max_timeline_captures": args.max_timeline_captures,
+        "max_capture_attempts_per_tweet": args.max_capture_attempts_per_tweet,
+        "checkpoint_every": args.checkpoint_every,
+        "sleep_seconds": args.sleep_seconds,
+        "sleep_events": 0,
+        "sleep_seconds_requested": 0.0,
+        "cdx_network_requests": 0,
+        "timeline_cache_hits": 0,
+        "timeline_network_fetches": 0,
+        "timeline_fetch_errors": 0,
+        "status_cache_hits": 0,
+        "status_network_fetches": 0,
+        "status_fetch_errors": 0,
+        "status_capture_attempts": 0,
+        "status_capture_attempts_skipped_by_limit": 0,
+        "status_capture_attempts_without_text": 0,
+        "tweets_recovered_from_second_or_later_capture": 0,
+        "timings": {},
+    }
+
+
+def build_summary(
+    *,
+    args: argparse.Namespace,
+    output_dir: Path,
+    derived_dir: Path,
+    cdx_dir: Path,
+    raw_dir: Path,
+    timeline_rows: list[dict[str, Any]],
+    status_rows: list[dict[str, Any]],
+    status_groups: dict[str, list[dict[str, Any]]],
+    recovered_tweets: list[dict[str, Any]],
+    profile_snapshots: list[dict[str, Any]],
+    timeline_discovered_ids: set[str],
+    timeline_limit: int,
+    timeline_processed_count: int,
+    status_requested_count: int,
+    status_processed_count: int,
+    timeline_enriched_count: int,
+    timeline_only_count: int,
+    diagnostics: dict[str, Any],
+    run_completion: str,
+    timeline_merge_applied: bool,
+) -> dict[str, Any]:
+    requested_all_status_ids = status_requested_count == len(status_groups)
+    complete = (
+        run_completion == "complete"
+        and timeline_processed_count >= min(timeline_limit, len(timeline_rows))
+        and status_processed_count >= status_requested_count
+        and requested_all_status_ids
+        and timeline_merge_applied
+    )
+    return {
+        "account": args.account,
+        "output_dir": str(output_dir),
+        "generated_at_utc": utc_now_iso(),
+        "run_completion": run_completion,
+        "timeline_merge_applied": timeline_merge_applied,
+        "status_processing_complete": complete,
+        "timeline_capture_rows": len(timeline_rows),
+        "status_capture_rows": len(status_rows),
+        "unique_tweet_ids": len(status_groups),
+        "status_tweet_ids_requested": status_requested_count,
+        "status_tweet_ids_processed": status_processed_count,
+        "materialized_tweet_ids": len(recovered_tweets),
+        "timeline_capture_rows_materialized": timeline_processed_count,
+        "tweets_with_recovered_content": sum(1 for row in recovered_tweets if row.get("tweet_text")),
+        "json_recoveries": sum(1 for row in recovered_tweets if row.get("recovery_source") == "json" and row.get("tweet_text")),
+        "html_recoveries": sum(1 for row in recovered_tweets if row.get("recovery_source") == "html" and row.get("tweet_text")),
+        "timeline_recoveries": sum(
+            1 for row in recovered_tweets if row.get("recovery_source") == "timeline_html" and row.get("tweet_text")
+        ),
+        "metadata_only_rows": sum(1 for row in recovered_tweets if row.get("source_quality") == "metadata_only"),
+        "profile_snapshot_count": len(profile_snapshots),
+        "timeline_discovered_tweet_ids": len(timeline_discovered_ids),
+        "timeline_only_discovered_tweet_ids": len(timeline_discovered_ids - set(status_groups.keys())),
+        "timeline_only_recovered_tweet_ids": timeline_only_count,
+        "status_inventory_tweets_enriched_from_timeline": timeline_enriched_count,
+        "earliest_tweet_created_at": min((row.get("tweet_created_at") for row in recovered_tweets if row.get("tweet_created_at")), default=None),
+        "latest_tweet_created_at": max((row.get("tweet_created_at") for row in recovered_tweets if row.get("tweet_created_at")), default=None),
+        "earliest_archive_capture": min((row["timestamp"] for row in status_rows + timeline_rows), default=None),
+        "latest_archive_capture": max((row["timestamp"] for row in status_rows + timeline_rows), default=None),
+        "status_mimetype_counts": dict(Counter((row.get("mimetype") or "unk").split(";")[0] for row in status_rows).most_common()),
+        "statuscode_counts": dict(Counter(row.get("statuscode") or "" for row in status_rows).most_common()),
+        "raw_files": {
+            "cdx_dir": str(cdx_dir),
+            "status_json_dir": str(raw_dir / "status_json"),
+            "status_html_dir": str(raw_dir / "status_html"),
+            "timeline_html_dir": str(raw_dir / "timeline_html"),
+        },
+        "derived_files": {
+            "inventory_summary_json": str(derived_dir / "inventory_summary.json"),
+            "acquisition_plan_md": str(derived_dir / "ACQUISITION_PLAN.md"),
+            "tweets_json": str(derived_dir / "tweets_recovered_deduped.json"),
+            "tweets_jsonl": str(derived_dir / "tweets_recovered.jsonl"),
+            "capture_index_csv": str(derived_dir / "tweet_capture_index.csv"),
+            "profile_snapshots_csv": str(derived_dir / "profile_snapshots.csv"),
+            "dataset_json": str(derived_dir / "twitter_wayback_dataset.json"),
+            "report_md": str(derived_dir / "REPORT.md"),
+        },
+        "diagnostics": diagnostics,
+    }
+
+
+def write_recovery_outputs(
+    *,
+    args: argparse.Namespace,
+    output_dir: Path,
+    derived_dir: Path,
+    cdx_dir: Path,
+    raw_dir: Path,
+    timeline_rows: list[dict[str, Any]],
+    status_rows: list[dict[str, Any]],
+    status_groups: dict[str, list[dict[str, Any]]],
+    recovered_tweets: list[dict[str, Any]],
+    profile_snapshots: list[dict[str, Any]],
+    capture_index_rows: list[dict[str, Any]],
+    timeline_discovered_ids: set[str],
+    timeline_limit: int,
+    timeline_processed_count: int,
+    status_requested_count: int,
+    status_processed_count: int,
+    timeline_enriched_count: int,
+    timeline_only_count: int,
+    diagnostics: dict[str, Any],
+    run_completion: str,
+    timeline_merge_applied: bool,
+) -> dict[str, Any]:
+    summary = build_summary(
+        args=args,
+        output_dir=output_dir,
+        derived_dir=derived_dir,
+        cdx_dir=cdx_dir,
+        raw_dir=raw_dir,
+        timeline_rows=timeline_rows,
+        status_rows=status_rows,
+        status_groups=status_groups,
+        recovered_tweets=recovered_tweets,
+        profile_snapshots=profile_snapshots,
+        timeline_discovered_ids=timeline_discovered_ids,
+        timeline_limit=timeline_limit,
+        timeline_processed_count=timeline_processed_count,
+        status_requested_count=status_requested_count,
+        status_processed_count=status_processed_count,
+        timeline_enriched_count=timeline_enriched_count,
+        timeline_only_count=timeline_only_count,
+        diagnostics=diagnostics,
+        run_completion=run_completion,
+        timeline_merge_applied=timeline_merge_applied,
+    )
+    dataset_bundle = {
+        "summary": summary,
+        "tweets": recovered_tweets,
+        "profile_snapshots": profile_snapshots,
+        "capture_index": capture_index_rows,
+        "timeline_discovered_tweet_ids": sorted(timeline_discovered_ids),
+    }
+    write_json(derived_dir / "extraction_summary.json", summary)
+    write_json(derived_dir / "tweets_recovered_deduped.json", recovered_tweets)
+    write_jsonl(derived_dir / "tweets_recovered.jsonl", recovered_tweets)
+    write_json(derived_dir / "twitter_wayback_dataset.json", dataset_bundle)
+    write_csv(
+        derived_dir / "tweet_capture_index.csv",
+        capture_index_rows,
+        [
+            "tweet_id",
+            "canonical_tweet_url",
+            "tweet_created_at_estimated",
+            "capture_count",
+            "first_capture_timestamp",
+            "last_capture_timestamp",
+            "best_capture_timestamp",
+            "best_capture_original",
+            "best_capture_mimetype",
+            "best_capture_statuscode",
+            "capture_statuscodes",
+            "capture_mimetypes",
+        ],
+    )
+    write_csv(
+        derived_dir / "profile_snapshots.csv",
+        profile_snapshots,
+        [
+            "snapshot_timestamp",
+            "source_type",
+            "capture_name",
+            "screen_name",
+            "name",
+            "title",
+            "description",
+            "location",
+            "url",
+            "joined_display",
+            "followers_count",
+            "friends_count",
+            "statuses_count",
+            "favourites_count",
+            "listed_count",
+            "user_id",
+            "profile_image_url_https",
+            "profile_banner_url",
+            "profile_background_image_url_https",
+            "verified",
+            "protected",
+            "lang",
+            "visible_tweet_ids",
+            "archive_capture_url",
+            "raw_payload_path",
+        ],
+    )
+    (derived_dir / "REPORT.md").write_text(build_report(summary=summary, tweets=recovered_tweets, profile_snapshots=profile_snapshots), encoding="utf-8")
+    return summary
+
+
 def main() -> None:
     args = parse_args()
     output_dir = ensure_dir(args.output_dir or default_output_dir(args.account))
@@ -1285,19 +1704,24 @@ def main() -> None:
     ensure_dir(raw_dir / "status_misc")
     ensure_dir(raw_dir / "timeline_html")
 
+    diagnostics = build_runtime_diagnostics(args)
+    run_started = time.perf_counter()
     session = make_session()
     all_cdx_rows: dict[str, list[dict[str, str]]] = {}
     cdx_targets = build_cdx_targets(args.account)
+    cdx_started = time.perf_counter()
     for target in cdx_targets:
         snapshot_path = cdx_dir / f"{target['name']}.json"
         if args.offline:
             rows, snapshot = load_cdx_snapshot(snapshot_path)
         else:
             rows, snapshot = fetch_cdx_inventory(session, target, retries=args.retries, sleep_seconds=args.sleep_seconds)
+            diagnostics["cdx_network_requests"] += 1
         all_cdx_rows[target["name"]] = rows
         if not args.offline:
             write_json(snapshot_path, snapshot)
-            sleep_with_jitter(args.sleep_seconds)
+            maybe_sleep(args.sleep_seconds, diagnostics=diagnostics, enabled=True)
+    diagnostics["timings"]["cdx_inventory_seconds"] = round(time.perf_counter() - cdx_started, 3)
 
     timeline_rows: list[dict[str, Any]] = []
     for name, rows in all_cdx_rows.items():
@@ -1329,6 +1753,37 @@ def main() -> None:
     for row in status_rows:
         status_groups[row["tweet_id"]].append(row)
 
+    overview = build_inventory_overview(
+        account=args.account,
+        output_dir=output_dir,
+        all_cdx_rows=all_cdx_rows,
+        timeline_rows=timeline_rows,
+        status_rows=status_rows,
+        status_groups=status_groups,
+        args=args,
+    )
+    write_inventory_outputs(derived_dir, overview)
+    print_inventory_overview(overview)
+    if args.overview_only:
+        diagnostics["timings"]["total_runtime_seconds"] = round(time.perf_counter() - run_started, 3)
+        summary = {
+            "account": args.account,
+            "output_dir": str(output_dir),
+            "generated_at_utc": utc_now_iso(),
+            "run_completion": "overview_only",
+            "timeline_capture_rows": len(timeline_rows),
+            "status_capture_rows": len(status_rows),
+            "unique_tweet_ids": len(status_groups),
+            "derived_files": {
+                "inventory_summary_json": str(derived_dir / "inventory_summary.json"),
+                "acquisition_plan_md": str(derived_dir / "ACQUISITION_PLAN.md"),
+            },
+            "diagnostics": diagnostics,
+        }
+        write_json(derived_dir / "extraction_summary.json", summary)
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return
+
     capture_index_rows: list[dict[str, Any]] = []
     recovered_tweets: list[dict[str, Any]] = []
     profile_snapshots: list[dict[str, Any]] = []
@@ -1338,6 +1793,8 @@ def main() -> None:
     timeline_candidate_history: dict[str, list[dict[str, Any]]] = defaultdict(list)
 
     timeline_limit = args.max_timeline_captures or len(timeline_rows)
+    timeline_processed_count = 0
+    timeline_started = time.perf_counter()
     for idx, capture in enumerate(timeline_rows[:timeline_limit], start=1):
         fetched = fetch_and_store_timeline_capture(
             session,
@@ -1347,7 +1804,9 @@ def main() -> None:
             sleep_seconds=args.sleep_seconds,
             refresh_existing=args.refresh_existing,
             offline=args.offline,
+            diagnostics=diagnostics,
         )
+        timeline_processed_count = idx
         if not fetched.get("content"):
             continue
         snapshot, visible_tweets = parse_timeline_capture(fetched["content"], fetched, args.account)
@@ -1372,112 +1831,196 @@ def main() -> None:
             if current is None or timeline_candidate_rank(candidate) > timeline_candidate_rank(current):
                 timeline_tweet_candidates[tweet_id] = candidate
         if idx % 10 == 0 or idx == timeline_limit:
-            print(f"[timeline] fetched {idx}/{timeline_limit} captures")
-        sleep_with_jitter(args.sleep_seconds)
+            elapsed = time.perf_counter() - timeline_started
+            print(
+                "[timeline] "
+                f"{idx}/{timeline_limit} captures | discovered_ids={len(timeline_tweet_candidates)} "
+                f"cache={diagnostics['timeline_cache_hits']} network={diagnostics['timeline_network_fetches']} "
+                f"errors={diagnostics['timeline_fetch_errors']} eta={estimate_eta(elapsed, idx, timeline_limit)}",
+                flush=True,
+            )
+        maybe_sleep(
+            args.sleep_seconds,
+            diagnostics=diagnostics,
+            enabled=fetched.get("fetch_source") == "network",
+        )
+    diagnostics["timings"]["timeline_processing_seconds"] = round(time.perf_counter() - timeline_started, 3)
 
     tweet_ids = sorted(status_groups.keys(), key=lambda value: int(value))
     if args.max_tweets is not None:
         tweet_ids = tweet_ids[: args.max_tweets]
+    status_requested_count = len(tweet_ids)
+    status_processed_count = 0
+    interrupted = False
+    status_started = time.perf_counter()
 
-    for idx, tweet_id in enumerate(tweet_ids, start=1):
-        captures = status_groups[tweet_id]
-        canonical: dict[str, Any] | None = None
-        snapshot: dict[str, Any] | None = None
-        prepared_capture: dict[str, Any] | None = None
-        ranked_captures = sorted(captures, key=capture_rank, reverse=True)
-        for candidate_capture in ranked_captures:
-            prepared_capture = fetch_and_store_capture(
-                session,
-                dict(candidate_capture),
-                raw_dir=raw_dir,
-                retries=args.retries,
-                sleep_seconds=args.sleep_seconds,
-                refresh_existing=args.refresh_existing,
-                offline=args.offline,
-            )
-            content = prepared_capture.get("content", "")
-            if not content:
-                continue
-            candidate_canonical, candidate_snapshot = parse_status_capture_candidate(content, prepared_capture)
-            if candidate_canonical is None:
-                continue
-            canonical = candidate_canonical
-            snapshot = candidate_snapshot
-            if canonical.get("tweet_text"):
-                break
+    def checkpoint(run_completion: str, *, timeline_merge_applied: bool, timeline_enriched_count: int = 0, timeline_only_count: int = 0) -> None:
+        summary = write_recovery_outputs(
+            args=args,
+            output_dir=output_dir,
+            derived_dir=derived_dir,
+            cdx_dir=cdx_dir,
+            raw_dir=raw_dir,
+            timeline_rows=timeline_rows,
+            status_rows=status_rows,
+            status_groups=status_groups,
+            recovered_tweets=recovered_tweets,
+            profile_snapshots=profile_snapshots,
+            capture_index_rows=capture_index_rows,
+            timeline_discovered_ids=timeline_discovered_ids,
+            timeline_limit=timeline_limit,
+            timeline_processed_count=timeline_processed_count,
+            status_requested_count=status_requested_count,
+            status_processed_count=status_processed_count,
+            timeline_enriched_count=timeline_enriched_count,
+            timeline_only_count=timeline_only_count,
+            diagnostics=diagnostics,
+            run_completion=run_completion,
+            timeline_merge_applied=timeline_merge_applied,
+        )
+        print(
+            "[checkpoint] "
+            f"run_completion={run_completion} status_ids={status_processed_count}/{status_requested_count} "
+            f"materialized={summary['materialized_tweet_ids']} with_text={summary['tweets_with_recovered_content']}",
+            flush=True,
+        )
 
-        if canonical is None:
-            prepared_capture = prepared_capture or dict(choose_best_capture(captures))
-            canonical = {
-                "tweet_id": tweet_id,
-                "tweet_url": canonical_status_url(prepared_capture["original"], tweet_id),
-                "tweet_created_at": snowflake_to_iso(tweet_id),
-                "tweet_created_at_from": "snowflake",
-                "tweet_text": None,
-                "tweet_text_source": None,
-                "lang": None,
-                "source": None,
-                "truncated": None,
-                "is_retweet": None,
-                "is_quote": None,
-                "is_reply": None,
-                "in_reply_to_status_id": None,
-                "in_reply_to_user_id": None,
-                "in_reply_to_screen_name": None,
-                "conversation_id": None,
-                "retweet_count": None,
-                "favorite_count": None,
-                "quote_count": None,
-                "reply_count": None,
-                "possibly_sensitive": None,
-                "hashtags": [],
-                "mentions": [],
-                "urls": [],
-                "expanded_urls": [],
-                "media_urls": [],
-                "media_expanded_urls": [],
-                "user": {"user_id": None, "screen_name": None, "name": None, "description": None, "location": None, "verified": None},
-                "retweeted_status_id": None,
-                "quoted_status_id": None,
-                "archive_capture_timestamp": prepared_capture["timestamp"],
-                "archive_capture_datetime": parse_capture_timestamp(prepared_capture["timestamp"]).isoformat().replace("+00:00", "Z"),
-                "archive_capture_url": prepared_capture["replay_url"],
-                "archive_capture_mimetype": prepared_capture["mimetype"],
-                "archive_capture_statuscode": prepared_capture["statuscode"],
-                "recovery_source": "metadata_only",
-                "source_quality": "metadata_only",
-                "raw_payload_path": prepared_capture["raw_path"],
-            }
+    try:
+        for idx, tweet_id in enumerate(tweet_ids, start=1):
+            captures = status_groups[tweet_id]
+            canonical: dict[str, Any] | None = None
+            snapshot: dict[str, Any] | None = None
+            prepared_capture: dict[str, Any] | None = None
+            ranked_captures = sorted(captures, key=capture_rank, reverse=True)
+            attempts_for_tweet = 0
+            for capture_idx, candidate_capture in enumerate(ranked_captures, start=1):
+                if args.max_capture_attempts_per_tweet is not None and capture_idx > args.max_capture_attempts_per_tweet:
+                    diagnostics["status_capture_attempts_skipped_by_limit"] += len(ranked_captures) - args.max_capture_attempts_per_tweet
+                    break
+                diagnostics["status_capture_attempts"] += 1
+                attempts_for_tweet += 1
+                prepared_capture = fetch_and_store_capture(
+                    session,
+                    dict(candidate_capture),
+                    raw_dir=raw_dir,
+                    retries=args.retries,
+                    sleep_seconds=args.sleep_seconds,
+                    refresh_existing=args.refresh_existing,
+                    offline=args.offline,
+                    diagnostics=diagnostics,
+                )
+                content = prepared_capture.get("content", "")
+                maybe_sleep(
+                    args.sleep_seconds,
+                    diagnostics=diagnostics,
+                    enabled=prepared_capture.get("fetch_source") == "network",
+                )
+                if not content:
+                    continue
+                candidate_canonical, candidate_snapshot = parse_status_capture_candidate(content, prepared_capture)
+                if candidate_canonical is None:
+                    continue
+                canonical = candidate_canonical
+                snapshot = candidate_snapshot
+                if canonical.get("tweet_text"):
+                    if attempts_for_tweet > 1:
+                        diagnostics["tweets_recovered_from_second_or_later_capture"] += 1
+                    break
 
-        capture_history = [
-            {
-                "timestamp": capture["timestamp"],
-                "archive_datetime": parse_capture_timestamp(capture["timestamp"]).isoformat().replace("+00:00", "Z"),
-                "original": capture["original"],
-                "replay_url": capture["replay_url"],
-                "mimetype": capture.get("mimetype"),
-                "statuscode": capture.get("statuscode"),
-                "digest": capture.get("digest"),
-                "length": capture.get("length"),
-            }
-            for capture in sorted(captures, key=lambda row: row["timestamp"])
-        ]
-        canonical["capture_history"] = capture_history
-        canonical["capture_count"] = len(capture_history)
-        canonical["first_capture_timestamp"] = capture_history[0]["timestamp"] if capture_history else None
-        canonical["last_capture_timestamp"] = capture_history[-1]["timestamp"] if capture_history else None
-        canonical["first_capture_datetime"] = capture_history[0]["archive_datetime"] if capture_history else None
-        canonical["last_capture_datetime"] = capture_history[-1]["archive_datetime"] if capture_history else None
-        canonical["snowflake_created_at"] = snowflake_to_iso(tweet_id)
-        canonical["account_handle_observed"] = regex_first([r"twitter\.com/([^/]+)/status"], prepared_capture["original"], flags=re.IGNORECASE)
-        canonical["capture_inventory_originals"] = sorted(dict.fromkeys(capture["original"] for capture in captures))
-        recovered_tweets.append(canonical)
-        if snapshot is not None:
-            profile_snapshots.append(snapshot)
-        capture_index_rows.append(summarize_capture_group(tweet_id, captures, canonical))
-        if idx % 25 == 0 or idx == len(tweet_ids):
-            print(f"[tweets] materialized {idx}/{len(tweet_ids)} tweet IDs")
-        sleep_with_jitter(args.sleep_seconds)
+            if canonical is None or not canonical.get("tweet_text"):
+                diagnostics["status_capture_attempts_without_text"] += attempts_for_tweet
+
+            if canonical is None:
+                prepared_capture = prepared_capture or dict(choose_best_capture(captures))
+                canonical = {
+                    "tweet_id": tweet_id,
+                    "tweet_url": canonical_status_url(prepared_capture["original"], tweet_id),
+                    "tweet_created_at": snowflake_to_iso(tweet_id),
+                    "tweet_created_at_from": "snowflake",
+                    "tweet_text": None,
+                    "tweet_text_source": None,
+                    "lang": None,
+                    "source": None,
+                    "truncated": None,
+                    "is_retweet": None,
+                    "is_quote": None,
+                    "is_reply": None,
+                    "in_reply_to_status_id": None,
+                    "in_reply_to_user_id": None,
+                    "in_reply_to_screen_name": None,
+                    "conversation_id": None,
+                    "retweet_count": None,
+                    "favorite_count": None,
+                    "quote_count": None,
+                    "reply_count": None,
+                    "possibly_sensitive": None,
+                    "hashtags": [],
+                    "mentions": [],
+                    "urls": [],
+                    "expanded_urls": [],
+                    "media_urls": [],
+                    "media_expanded_urls": [],
+                    "user": {"user_id": None, "screen_name": None, "name": None, "description": None, "location": None, "verified": None},
+                    "retweeted_status_id": None,
+                    "quoted_status_id": None,
+                    "archive_capture_timestamp": prepared_capture["timestamp"],
+                    "archive_capture_datetime": parse_capture_timestamp(prepared_capture["timestamp"]).isoformat().replace("+00:00", "Z"),
+                    "archive_capture_url": prepared_capture["replay_url"],
+                    "archive_capture_mimetype": prepared_capture["mimetype"],
+                    "archive_capture_statuscode": prepared_capture["statuscode"],
+                    "recovery_source": "metadata_only",
+                    "source_quality": "metadata_only",
+                    "raw_payload_path": prepared_capture["raw_path"],
+                }
+
+            capture_history = [
+                {
+                    "timestamp": capture["timestamp"],
+                    "archive_datetime": parse_capture_timestamp(capture["timestamp"]).isoformat().replace("+00:00", "Z"),
+                    "original": capture["original"],
+                    "replay_url": capture["replay_url"],
+                    "mimetype": capture.get("mimetype"),
+                    "statuscode": capture.get("statuscode"),
+                    "digest": capture.get("digest"),
+                    "length": capture.get("length"),
+                }
+                for capture in sorted(captures, key=lambda row: row["timestamp"])
+            ]
+            canonical["capture_history"] = capture_history
+            canonical["capture_count"] = len(capture_history)
+            canonical["first_capture_timestamp"] = capture_history[0]["timestamp"] if capture_history else None
+            canonical["last_capture_timestamp"] = capture_history[-1]["timestamp"] if capture_history else None
+            canonical["first_capture_datetime"] = capture_history[0]["archive_datetime"] if capture_history else None
+            canonical["last_capture_datetime"] = capture_history[-1]["archive_datetime"] if capture_history else None
+            canonical["snowflake_created_at"] = snowflake_to_iso(tweet_id)
+            canonical["account_handle_observed"] = regex_first([r"twitter\.com/([^/]+)/status"], prepared_capture["original"], flags=re.IGNORECASE)
+            canonical["capture_inventory_originals"] = sorted(dict.fromkeys(capture["original"] for capture in captures))
+            recovered_tweets.append(canonical)
+            if snapshot is not None:
+                profile_snapshots.append(snapshot)
+            capture_index_rows.append(summarize_capture_group(tweet_id, captures, canonical))
+            status_processed_count = idx
+            if idx % 25 == 0 or idx == len(tweet_ids):
+                elapsed = time.perf_counter() - status_started
+                recovered_texts = sum(1 for row in recovered_tweets if row.get("tweet_text"))
+                metadata_only = sum(1 for row in recovered_tweets if row.get("source_quality") == "metadata_only")
+                print(
+                    "[tweets] "
+                    f"{idx}/{len(tweet_ids)} status IDs | with_text={recovered_texts} metadata={metadata_only} "
+                    f"attempts={diagnostics['status_capture_attempts']} cache={diagnostics['status_cache_hits']} "
+                    f"network={diagnostics['status_network_fetches']} errors={diagnostics['status_fetch_errors']} "
+                    f"eta={estimate_eta(elapsed, idx, len(tweet_ids))}",
+                    flush=True,
+                )
+            if args.checkpoint_every and idx % args.checkpoint_every == 0:
+                diagnostics["timings"]["status_processing_seconds"] = round(time.perf_counter() - status_started, 3)
+                diagnostics["timings"]["total_runtime_seconds"] = round(time.perf_counter() - run_started, 3)
+                checkpoint("checkpoint", timeline_merge_applied=False)
+    except KeyboardInterrupt:
+        interrupted = True
+        print("[interrupt] received Ctrl+C; writing partial derived outputs from completed work", flush=True)
+
+    diagnostics["timings"]["status_processing_seconds"] = round(time.perf_counter() - status_started, 3)
 
     recovered_by_id = {row["tweet_id"]: row for row in recovered_tweets}
     timeline_enriched_count = 0
@@ -1537,112 +2080,34 @@ def main() -> None:
     profile_snapshots = dedupe_profile_snapshots(profile_snapshots)
     recovered_tweets.sort(key=lambda row: (row.get("tweet_created_at") or "", row["tweet_id"]))
     capture_index_rows.sort(key=lambda row: (row.get("tweet_created_at_estimated") or "", row["tweet_id"]))
-
-    summary = {
-        "account": args.account,
-        "output_dir": str(output_dir),
-        "generated_at_utc": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-        "timeline_capture_rows": len(timeline_rows),
-        "status_capture_rows": len(status_rows),
-        "unique_tweet_ids": len(status_groups),
-        "materialized_tweet_ids": len(recovered_tweets),
-        "timeline_capture_rows_materialized": min(timeline_limit, len(timeline_rows)),
-        "tweets_with_recovered_content": sum(1 for row in recovered_tweets if row.get("tweet_text")),
-        "json_recoveries": sum(1 for row in recovered_tweets if row.get("recovery_source") == "json" and row.get("tweet_text")),
-        "html_recoveries": sum(1 for row in recovered_tweets if row.get("recovery_source") == "html" and row.get("tweet_text")),
-        "timeline_recoveries": sum(
-            1 for row in recovered_tweets if row.get("recovery_source") == "timeline_html" and row.get("tweet_text")
-        ),
-        "metadata_only_rows": sum(1 for row in recovered_tweets if row.get("source_quality") == "metadata_only"),
-        "profile_snapshot_count": len(profile_snapshots),
-        "timeline_discovered_tweet_ids": len(timeline_discovered_ids),
-        "timeline_only_discovered_tweet_ids": len(timeline_discovered_ids - set(status_groups.keys())),
-        "timeline_only_recovered_tweet_ids": timeline_only_count,
-        "status_inventory_tweets_enriched_from_timeline": timeline_enriched_count,
-        "earliest_tweet_created_at": min((row.get("tweet_created_at") for row in recovered_tweets if row.get("tweet_created_at")), default=None),
-        "latest_tweet_created_at": max((row.get("tweet_created_at") for row in recovered_tweets if row.get("tweet_created_at")), default=None),
-        "earliest_archive_capture": min((row["timestamp"] for row in status_rows + timeline_rows), default=None),
-        "latest_archive_capture": max((row["timestamp"] for row in status_rows + timeline_rows), default=None),
-        "status_mimetype_counts": dict(Counter((row.get("mimetype") or "unk").split(";")[0] for row in status_rows).most_common()),
-        "statuscode_counts": dict(Counter(row.get("statuscode") or "" for row in status_rows).most_common()),
-        "raw_files": {
-            "cdx_dir": str(cdx_dir),
-            "status_json_dir": str(raw_dir / "status_json"),
-            "status_html_dir": str(raw_dir / "status_html"),
-            "timeline_html_dir": str(raw_dir / "timeline_html"),
-        },
-        "derived_files": {
-            "tweets_json": str(derived_dir / "tweets_recovered_deduped.json"),
-            "tweets_jsonl": str(derived_dir / "tweets_recovered.jsonl"),
-            "capture_index_csv": str(derived_dir / "tweet_capture_index.csv"),
-            "profile_snapshots_csv": str(derived_dir / "profile_snapshots.csv"),
-            "dataset_json": str(derived_dir / "twitter_wayback_dataset.json"),
-            "report_md": str(derived_dir / "REPORT.md"),
-        },
-    }
-
-    dataset_bundle = {
-        "summary": summary,
-        "tweets": recovered_tweets,
-        "profile_snapshots": profile_snapshots,
-        "capture_index": capture_index_rows,
-        "timeline_discovered_tweet_ids": sorted(timeline_discovered_ids),
-    }
-
-    write_json(derived_dir / "extraction_summary.json", summary)
-    write_json(derived_dir / "tweets_recovered_deduped.json", recovered_tweets)
-    write_jsonl(derived_dir / "tweets_recovered.jsonl", recovered_tweets)
-    write_json(derived_dir / "twitter_wayback_dataset.json", dataset_bundle)
-    write_csv(
-        derived_dir / "tweet_capture_index.csv",
-        capture_index_rows,
-        [
-            "tweet_id",
-            "canonical_tweet_url",
-            "tweet_created_at_estimated",
-            "capture_count",
-            "first_capture_timestamp",
-            "last_capture_timestamp",
-            "best_capture_timestamp",
-            "best_capture_original",
-            "best_capture_mimetype",
-            "best_capture_statuscode",
-            "capture_statuscodes",
-            "capture_mimetypes",
-        ],
+    diagnostics["timings"]["total_runtime_seconds"] = round(time.perf_counter() - run_started, 3)
+    run_completion = "interrupted" if interrupted else "complete"
+    if args.max_tweets is not None or args.max_timeline_captures is not None or args.max_capture_attempts_per_tweet is not None:
+        if run_completion == "complete":
+            run_completion = "partial"
+    summary = write_recovery_outputs(
+        args=args,
+        output_dir=output_dir,
+        derived_dir=derived_dir,
+        cdx_dir=cdx_dir,
+        raw_dir=raw_dir,
+        timeline_rows=timeline_rows,
+        status_rows=status_rows,
+        status_groups=status_groups,
+        recovered_tweets=recovered_tweets,
+        profile_snapshots=profile_snapshots,
+        capture_index_rows=capture_index_rows,
+        timeline_discovered_ids=timeline_discovered_ids,
+        timeline_limit=timeline_limit,
+        timeline_processed_count=timeline_processed_count,
+        status_requested_count=status_requested_count,
+        status_processed_count=status_processed_count,
+        timeline_enriched_count=timeline_enriched_count,
+        timeline_only_count=timeline_only_count,
+        diagnostics=diagnostics,
+        run_completion=run_completion,
+        timeline_merge_applied=True,
     )
-    write_csv(
-        derived_dir / "profile_snapshots.csv",
-        profile_snapshots,
-        [
-            "snapshot_timestamp",
-            "source_type",
-            "capture_name",
-            "screen_name",
-            "name",
-            "title",
-            "description",
-            "location",
-            "url",
-            "joined_display",
-            "followers_count",
-            "friends_count",
-            "statuses_count",
-            "favourites_count",
-            "listed_count",
-            "user_id",
-            "profile_image_url_https",
-            "profile_banner_url",
-            "profile_background_image_url_https",
-            "verified",
-            "protected",
-            "lang",
-            "visible_tweet_ids",
-            "archive_capture_url",
-            "raw_payload_path",
-        ],
-    )
-    (derived_dir / "REPORT.md").write_text(build_report(summary=summary, tweets=recovered_tweets, profile_snapshots=profile_snapshots), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
