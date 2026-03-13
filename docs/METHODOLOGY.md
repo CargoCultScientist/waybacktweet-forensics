@@ -415,6 +415,17 @@ from:{partner} (url:twitter.com/DeletedAccount/status/{tweet_id})
 
 These secondary searches, run via the Twitter/X search API (or scraping tools like Apify), can surface content from the deleted account that was quoted, screenshotted, or discussed by others.
 
+### Additional Search-Widening Methods Not Yet Implemented Here
+
+The current repo focuses on direct Wayback recovery from the supplied account handle plus offline reparsing of cached captures. Several useful widening strategies remain outside the shipped scripts:
+
+- **Handle-history expansion.** If the account ever renamed itself, query CDX separately for all known historical handles and merge inventories. The current extractor only targets the supplied handle plus its lowercase form.
+- **Additional permalink families.** Add CDX targets for modern `x.com` status URLs and internal permalink variants such as `twitter.com/i/web/status/{tweet_id}` when relevant. Some captures live under alternate host/path combinations even when the canonical desktop URL is sparse.
+- **Relationship-driven second pass.** Use recovered `in_reply_to_status_id`, `quoted_status_id`, `retweeted_status_id`, and `conversation_id` fields to queue additional archive searches for thread roots, quoted tweets, and neighboring replies.
+- **Media-side archive recovery.** Query archived `pbs.twimg.com`, `video.twimg.com`, and `pic.twitter.com` assets referenced by recovered tweets. Media sometimes survives even when the tweet page does not, and screenshots or thumbnails can preserve otherwise missing context.
+- **Digest/revisit resolution.** Use CDX `digest` clusters and `warc/revisit` records to chase the original payload-bearing capture for duplicate rows instead of treating revisit entries as terminal metadata.
+- **Automated ecosystem expansion.** This methodology describes mention-network, quote-tweet, conversation, and shared-URL expansion, but the repo does not yet ship scripts that operationalize those second-pass searches.
+
 ---
 
 ## Results Summary

@@ -2,7 +2,7 @@
 
 Portable extraction scripts for recovering deleted or suspended Twitter/X account content from the Wayback Machine.
 
-This repo seed was generated from the `transcript-lake` recovery workflow and is intended as a clean starting point for a standalone GitHub repository.
+This repository packages the recovery workflow as a standalone Python project for reusable Twitter/X Wayback analysis.
 
 ## Included Scripts
 
@@ -87,4 +87,4 @@ data/twitter_wayback/<account-slug>/
 
 - The extractor is networked; the refresh and triage scripts are offline.
 - Wayback rate limits aggressive querying. Use the built-in throttling and cached reruns.
-- `docs/METHODOLOGY.md` includes a real-world case study plus generalized recovery tactics.
+- `docs/METHODOLOGY.md` includes an anonymized case study plus generalized recovery tactics.
